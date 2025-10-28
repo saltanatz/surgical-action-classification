@@ -1,9 +1,7 @@
 # Surgical Video Dataset - Technical Report
 
 **Component:** `data_preprocessing/dataset.py`  
-**Purpose:** PyTorch dataset for laparoscopic surgical action recognition  
-**Date:** October 27, 2025
-
+PyTorch dataset for laparoscopic surgical action recognition  
 ---
 
 ## Overview
