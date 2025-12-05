@@ -87,6 +87,29 @@ class ResNetR2Plus1D(nn.Module):
         return logits
 
 
+    def load_r2plus1d_from_checkpoint(
+        self,
+        ckpt_path: str,
+        device: torch.device | str = "cuda" if torch.cuda.is_available() else "cpu",
+
+    ):
+        device = torch.device(device)
+        state = torch.load(ckpt_path, map_location=device)
+        if isinstance(state, dict) and "state_dict" in state:
+            state_dict = state["state_dict"]
+        elif isinstance(state, dict) and "model" in state:
+            state_dict = state["model"]
+        else:
+            state_dict = state
+
+        if any(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+        self.load_state_dict(state_dict, strict=False)
+        return self
+
+
+
 class LabelSmoothingCE(nn.Module):
     def __init__(self, smoothing: float = 0.05) -> None:
         super().__init__()
@@ -155,3 +178,4 @@ def group_params_r2plus1d(
         groups.append({"params": head_params, "lr": base_lr * 1.5})
 
     return groups
+
