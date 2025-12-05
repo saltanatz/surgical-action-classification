@@ -1,43 +1,75 @@
 # train.py
 import os
 import time
+import random
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
+import pandas as pd
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from dataset import ClipsDataset, get_train_transform, get_val_transform, get_num_classes
-from tsm_resnet import ResNetTSM, LabelSmoothingCE, group_params, accuracy
+from tsm_resnet import ResNetTSM, LabelSmoothingCE, group_params as tsm_group_params, accuracy
+from r2plus1d_resnet import ResNetR2Plus1D, group_params_r2plus1d
+from cnnlstm_resnet import CNNLSTM, group_params_cnnlstm   # <-- new file
 
 
-# Config
+# ------ Reproducibility --------
+
+def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# ------- Config --------
 
 @dataclass
 class TrainConfig:
-    root: str = "/your/dataset/root"
-    train_csv: str = "/your/train.csv"
-    val_csv: str = "/your/val.csv"
-    test_csv: str = "/your/test.csv"
+    # paths
+    root: str = "./dataset"
+    train_csv: str = "./dataset/train.csv"
+    val_csv: str = "./dataset/val.csv"
+    test_csv: str = "./dataset/test.csv"
 
+    # training
     num_epochs: int = 20
-    batch_size: int = 2
-    num_workers: int = 4
+    batch_size: int = 8
+    num_workers: int = 8
 
     base_lr: float = 1e-3
     weight_decay: float = 1e-4
 
     time_size: int = 16
     resize_shape: Tuple[int, int] = (224, 224)
-    use_pretrained: bool = False
+    use_pretrained: bool = True
     freeze_until: str = "layer2"
+
+    # which model to train: "tsm_resnet", "r2plus1d", "cnnlstm"
+    model_name: str = "tsm_resnet"
 
     save_dir: str = "checkpoints"
 
+    # sampler settings
+    use_class_balanced_sampler: bool = True
+    tau: float = 0.5  
 
-# Dataloaders
+    # loss
+    label_smoothing: float = 0.05
+
+    # CNN-LSTM
+    cnnlstm_pool: str = "mean"        
+    cnnlstm_hidden: int = 512
+    cnnlstm_layers: int = 1
+    cnnlstm_bidirectional: bool = False
+    cnnlstm_dropout: float = 0.2
+
+
+# ------- DataLoaders ---------
 
 def build_dataloaders(cfg: TrainConfig) -> Tuple[Dict[str, DataLoader], int]:
+    # datasets
     train_ds = ClipsDataset(
         data_path=cfg.root,
         csv_file=cfg.train_csv,
@@ -62,14 +94,47 @@ def build_dataloaders(cfg: TrainConfig) -> Tuple[Dict[str, DataLoader], int]:
         time_size=cfg.time_size,
     )
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-    )
+    # ---- class-balanced sampler for TRAIN ONLY ----
+    if cfg.use_class_balanced_sampler:
+        train_df = pd.read_csv(cfg.train_csv)
 
+        labs = train_df["label"].astype(str)
+        counts = labs.value_counts()
+
+        tau = cfg.tau
+        w_per_class = {lab: (counts[lab] ** (-tau)) for lab in counts.index}
+
+        # normalize weights to have mean ~ 1
+        m = sum(w_per_class.values()) / len(w_per_class)
+        w_per_class = {k: v / m for k, v in w_per_class.items()}
+
+        sample_weights = labs.map(lambda x: w_per_class[x]).astype(float).values
+
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=cfg.batch_size,
+            sampler=sampler,  
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+            persistent_workers=(cfg.num_workers > 0),
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+        )
+
+    # val/test: no rebalancing, just regular sequential loaders
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.batch_size,
@@ -91,7 +156,9 @@ def build_dataloaders(cfg: TrainConfig) -> Tuple[Dict[str, DataLoader], int]:
     return loaders, num_classes
 
 
-# Evaluation
+# -------------------------
+# Evaluation helpers
+# -------------------------
 
 def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> float:
     model.eval()
@@ -119,9 +186,54 @@ def format_seconds(secs: float) -> str:
     return f"{m:d}m {s:02d}s"
 
 
-# Model trainers
+# ------- Model builders ---------
 
-def train_tsm_resnet(
+def build_model_and_params(cfg: TrainConfig, num_classes: int, device: torch.device):
+    """
+    Returns model and param_groups for optimizer.
+    """
+    if cfg.model_name == "tsm_resnet":
+        model = ResNetTSM(
+            num_classes=num_classes,
+            num_segments=cfg.time_size,
+            freeze_until=cfg.freeze_until,
+            pretrained=cfg.use_pretrained,
+        )
+        param_groups = tsm_group_params(model, cfg.base_lr)
+
+    elif cfg.model_name == "r2plus1d":
+        model = ResNetR2Plus1D(
+            num_classes=num_classes,
+            num_segments=cfg.time_size,
+            freeze_until=cfg.freeze_until,
+            pretrained=cfg.use_pretrained,
+        )
+        param_groups = group_params_r2plus1d(model, cfg.base_lr)
+
+    elif cfg.model_name == "cnnlstm":
+        model = CNNLSTM(
+            num_classes=num_classes,
+            lstm_hidden=cfg.cnnlstm_hidden,
+            lstm_layers=cfg.cnnlstm_layers,
+            bidirectional=cfg.cnnlstm_bidirectional,
+            dropout=cfg.cnnlstm_dropout,
+            pool=cfg.cnnlstm_pool,
+            pretrained=cfg.use_pretrained,
+            freeze_until=cfg.freeze_until,
+        )
+        param_groups = group_params_cnnlstm(model, cfg.base_lr)
+
+    else:
+        raise ValueError(f"Unknown model_name: {cfg.model_name}")
+
+    model = model.to(device)
+    return model, param_groups
+
+
+# ------ Training loop ---------
+
+
+def train_model(
     cfg: TrainConfig,
     loaders: Dict[str, DataLoader],
     num_classes: int,
@@ -131,25 +243,19 @@ def train_tsm_resnet(
     val_loader = loaders["val"]
     test_loader = loaders["test"]
 
-    model = ResNetTSM(
-        num_classes=num_classes,
-        num_segments=cfg.time_size,
-        freeze_until=cfg.freeze_until,
-        pretrained=cfg.use_pretrained,
-    ).to(device)
+    model, param_groups = build_model_and_params(cfg, num_classes, device)
 
-    param_groups = group_params(model, cfg.base_lr)
     optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.num_epochs
     )
 
-    criterion = LabelSmoothingCE(0.05)
-    scaler = torch.cuda.amp.GradScaler()
+    criterion = LabelSmoothingCE(cfg.label_smoothing)
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
-    best_val = 0.0
+    best_val = -1.0
     os.makedirs(cfg.save_dir, exist_ok=True)
-    save_path = os.path.join(cfg.save_dir, "best_tsm_resnet.pth")
+    save_path = os.path.join(cfg.save_dir, f"best_{cfg.model_name}.pth")
 
     for epoch in range(cfg.num_epochs):
         epoch_start = time.time()
@@ -163,9 +269,9 @@ def train_tsm_resnet(
             clips = clips.to(device)
             labels = labels.to(device)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 logits = model(clips)
                 loss = criterion(logits, labels)
 
@@ -181,14 +287,14 @@ def train_tsm_resnet(
 
         scheduler.step()
 
-        train_loss = total_loss / steps
-        train_acc = total_acc / steps
+        train_loss = total_loss / max(1, steps)
+        train_acc = total_acc / max(1, steps)
         val_acc = evaluate(model, val_loader, device)
 
         epoch_time = time.time() - epoch_start
 
         print(
-            f"[TSM-ResNet] Epoch {epoch + 1}/{cfg.num_epochs} "
+            f"[{cfg.model_name}] Epoch {epoch + 1}/{cfg.num_epochs} "
             f"| loss={train_loss:.4f} acc={train_acc:.3f} "
             f"val_acc={val_acc:.3f} | time={format_seconds(epoch_time)}"
         )
@@ -204,74 +310,37 @@ def train_tsm_resnet(
                 save_path,
             )
             print(
-                f"Saved best TSM-ResNet → {save_path} "
+                f"Saved best {cfg.model_name} → {save_path} "
                 f"(val_acc={best_val:.3f})"
             )
 
+    # final test
     checkpoint = torch.load(save_path, map_location=device)
     model.load_state_dict(checkpoint["model"])
     test_acc = evaluate(model, test_loader, device)
-    print(f"[TSM-ResNet] Final Test Accuracy = {test_acc:.4f}")
+    print(f"[{cfg.model_name}] Final Test Accuracy = {test_acc:.4f}")
 
-
-MODEL_REGISTRY = {
-    "tsm_resnet": train_tsm_resnet,
-}
+# ----- Main -------
 
 def main():
-    cfg = TrainConfig(
-        root="/your/dataset/root",
-        train_csv="/your/train.csv",
-        val_csv="/your/val.csv",
-        test_csv="/your/test.csv",
-        num_epochs=20,
-        batch_size=2,
-        num_workers=4,
-        base_lr=1e-3,
-        weight_decay=1e-4,
-        use_pretrained=False,
-        time_size=16,
-        resize_shape=(224, 224),
-        freeze_until="layer2",
-        save_dir="checkpoints",
-    )
+    set_seed(42)
+    cfg = TrainConfig()   
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"Training model: {cfg.model_name}")
 
     loaders, num_classes = build_dataloaders(cfg)
 
-    models_to_run = [
-        "tsm_resnet",
-        # "my_other_model",
-    ]
+    model_start = time.time()
+    train_model(cfg, loaders, num_classes, device)
+    model_end = time.time()
 
-    overall_start = time.time()
-
-    for name in models_to_run:
-        if name not in MODEL_REGISTRY:
-            print(f"Model '{name}' is not registered, skipping.")
-            continue
-
-        print("\n" + "=" * 60)
-        print(f"Training model: {name}")
-        print("=" * 60)
-
-        model_start = time.time()
-        train_fn = MODEL_REGISTRY[name]
-        train_fn(cfg, loaders, num_classes, device)
-        model_end = time.time()
-
-        elapsed = model_end - model_start
-        print(
-            f"[{name}] Training time: {format_seconds(elapsed)} "
-            f"({elapsed:.1f} seconds)"
-        )
-
-    overall_end = time.time()
-    total_elapsed = overall_end - overall_start
-    print(f"\nAll models finished in {format_seconds(total_elapsed)}")
-
+    elapsed = model_end - model_start
+    print(
+        f"[{cfg.model_name}] Training time: {format_seconds(elapsed)} "
+        f"({elapsed:.1f} seconds)"
+    )
 
 if __name__ == "__main__":
     main()
